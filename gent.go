@@ -217,6 +217,7 @@ func addNodeType(file *jen.File, nodeType nodeType) error {
 			).
 			Id(createExportedName(fieldDef.name)).
 			Parens(jen.Null()).
+			Id(fieldDef.typeName).
 			Block(
 				jen.Return(jen.Id(structMethodIdentifier).Dot(createPrivateName(fieldDef.name))),
 			)
@@ -253,6 +254,8 @@ func addUnionType(file *jen.File, unionType unionType) error {
 			).
 			Id(fieldDef.typeName).
 			Parens(jen.Null()).
+			Op("*").
+			Id(fieldDef.typeName).
 			Block(
 				jen.Return(jen.Id(structMethodIdentifier).Dot(fieldDef.name)),
 			)
