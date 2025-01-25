@@ -4,16 +4,19 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"unicode"
 
 	"github.com/dave/jennifer/jen"
+	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
 
 var caser = cases.Title(language.English)
+var reservedNodeMethods = getNodeMethodNames()
 
 type Generator struct {
 	options GeneratorOptions
@@ -66,6 +69,13 @@ type structFieldDef struct {
 	typeName string
 	pointer  bool
 	array    bool
+}
+
+type structDef struct {
+	name string
+	// Tree-sitter node kind
+	tsKind string
+	fields []structFieldDef
 }
 
 // Inner map keys are all Tree-sitter node names
@@ -213,6 +223,9 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	}
 
 	file := jen.NewFile(packageName)
+
+	file.ImportName("github.com/tree-sitter/go-tree-sitter", "tree_sitter")
+
 	nm := newNodeMap()
 
 	// Get all the node types available in the file
@@ -317,8 +330,12 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		file.Comment("\nUNKNOWN TYPES\n")
 	}
-	for _, unknownType := range nm.unknown {
-		file.Type().Id(unknownType).Struct()
+	for tsKind, unknownType := range nm.unknown {
+		writeStruct(file, structDef{
+			name:   unknownType,
+			tsKind: tsKind,
+			fields: []structFieldDef{},
+		})
 	}
 
 	outputBuilder := &strings.Builder{}
@@ -374,7 +391,11 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
 	}
 
-	writeStruct(file, structName, fieldDefs)
+	writeStruct(file, structDef{
+		name:   structName,
+		tsKind: nodeType.Type,
+		fields: fieldDefs,
+	})
 
 	return nil
 }
@@ -397,14 +418,20 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 		})
 	}
 
-	writeStruct(file, unionType.name, fieldDefs)
+	writeStruct(file, structDef{
+		name:   unionType.name,
+		fields: fieldDefs,
+		// TODO: TS kind? Or separate validator logic into new functions, most likely
+	})
 
 	return nil
 }
 
-func writeStruct(file *jen.File, name string, fieldDefs []structFieldDef) {
-	structFields := []jen.Code{}
-	for _, fieldDef := range fieldDefs {
+func writeStruct(file *jen.File, def structDef) {
+	embedField := jen.Qual("github.com/tree-sitter/go-tree-sitter", "Node")
+	structFields := []jen.Code{embedField}
+
+	for _, fieldDef := range def.fields {
 		stmt := jen.Id(fieldDef.name)
 		if fieldDef.pointer {
 			stmt = stmt.Op("*")
@@ -416,30 +443,75 @@ func writeStruct(file *jen.File, name string, fieldDefs []structFieldDef) {
 		structFields = append(structFields, stmt)
 	}
 
-	file.Type().Id(name).Struct(structFields...)
+	file.Type().Id(def.name).Struct(structFields...)
 
-	structMethodIdentifier := strings.ToLower(string(name[0]))
-	for _, fieldDef := range fieldDefs {
-		file.Func().
+	structMethodIdentifier := strings.ToLower(string(def.name[0]))
+	for _, fieldDef := range def.fields {
+		funcName := strings.ToUpper(string(fieldDef.name[0])) + fieldDef.name[1:]
+
+		// Need to make sure we don't override any of the reserved node methods,
+		// so prefix with 'Get' until the name is unique.
+		for slices.Contains(reservedNodeMethods, funcName) {
+			funcName = "Get" + funcName
+		}
+
+		stmt := jen.Func().
 			Parens(
-				jen.Id(structMethodIdentifier).Op("*").Id(name),
+				jen.Id(structMethodIdentifier).Op("*").Id(def.name),
 			).
-			Id(fieldDef.typeName).
+			Id(funcName).
 			Parens(jen.Null())
 
 		if fieldDef.pointer {
-			file.Op("*")
+			stmt = stmt.Op("*")
 		}
 		if fieldDef.array {
-			file.Index()
+			stmt = stmt.Index()
 		}
 
-		file.
+		stmt = stmt.
 			Id(fieldDef.typeName).
 			Block(
 				jen.Return(jen.Id(structMethodIdentifier).Dot(fieldDef.name)),
 			)
+
+		file.Add(stmt)
 	}
+
+	file.Func().
+		Parens(
+			jen.Id(structMethodIdentifier).Op("*").Id(def.name),
+		).
+		Id("Validate").
+		Parens(jen.Id("node").Qual("github.com/tree-sitter/go-tree-sitter", "Node")).
+		Parens(
+			jen.List(
+				jen.Id(def.name),
+				jen.Error(),
+			),
+		).
+		Block(
+			// TODO: add validation logic
+			jen.
+				If(
+					jen.Id("node").Dot("Kind").Call().Op("!=").Lit(def.tsKind),
+				).
+				Block(
+					jen.Return(
+						jen.Id(def.name).Values(),
+						jen.Qual("fmt", "Errorf").Call(
+							jen.Lit("Expected node of kind "+strings.ReplaceAll(def.tsKind, "%", "%%")+", got %s"),
+							jen.Id("node").Dot("Kind").Call(),
+						),
+					),
+				),
+			jen.Return(
+				jen.Id(def.name).Values(jen.Dict{
+					jen.Id("Node"): jen.Id("node"),
+				}),
+				jen.Nil(),
+			),
+		)
 }
 
 // createExportedName creates a name that is safe to use as an exported symbol name
@@ -579,4 +651,15 @@ func isReservedKeyword(s string) bool {
 		return true
 	}
 	return false
+}
+
+func getNodeMethodNames() []string {
+	var node *tree_sitter.Node
+	t := reflect.TypeOf(node)
+
+	var names []string
+	for i := 0; i < t.NumMethod(); i++ {
+		names = append(names, t.Method(i).Name)
+	}
+	return names
 }

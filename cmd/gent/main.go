@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/isaacharrisholt/gent"
@@ -18,7 +19,9 @@ func main() {
 		},
 	}
 
-	cmd.Run(context.Background(), os.Args)
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func generateCommand() *cli.Command {
