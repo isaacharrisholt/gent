@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 
 	"github.com/isaacharrisholt/gent"
@@ -19,9 +18,7 @@ func main() {
 		},
 	}
 
-	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		log.Fatal(err)
-	}
+	cmd.Run(context.Background(), os.Args)
 }
 
 func generateCommand() *cli.Command {
@@ -46,6 +43,11 @@ func generateCommand() *cli.Command {
 				Aliases: []string{"o"},
 				Usage:   "Specify the `OUTPUT` file path used for the generated code. If not specified, the output will be written to stdout.",
 			},
+			&cli.BoolFlag{
+				Name:  "debug",
+				Usage: "Run the generator in debug mode, adding extra comments to the generated file and printing debug logs to stderr.",
+				Value: false,
+			},
 		},
 	}
 }
@@ -63,6 +65,7 @@ func generateCommandAction(ctx context.Context, cmd *cli.Command) error {
 
 	generator := gent.NewGenerator(gent.GeneratorOptions{
 		PackageName: cmd.String("package"),
+		Debug:       cmd.Bool("debug"),
 	})
 	output, err := generator.Generate(fileContent)
 	if err != nil {
@@ -76,7 +79,7 @@ func generateCommandAction(ctx context.Context, cmd *cli.Command) error {
 		return nil
 	}
 
-	fmt.Println(output)
+	fmt.Print(output)
 
 	return nil
 }

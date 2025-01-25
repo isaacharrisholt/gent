@@ -21,6 +21,9 @@ type Generator struct {
 
 type GeneratorOptions struct {
 	PackageName string
+	// Run the generator in debug mode, adding extra comments to the generated file
+	// and printing debug logs to stderr.
+	Debug bool
 	// TODO: Add more options
 }
 
@@ -63,6 +66,133 @@ type structFieldDef struct {
 	typeName string
 }
 
+// Inner map keys are all Tree-sitter node names
+type nodeMap struct {
+	// Top-level node definitions, supertypes.
+	// Values are struct names.
+	namedExported map[string]string
+
+	// Symbols, etc. that have `"named": false` but still need exporting.
+	// Values are struct names.
+	unnamedExported map[string]string
+
+	// Supertypes. Values are `unionType` structs.
+	supertypes map[string]unionType
+
+	// Types made from a combination of other types, e.g. the multiple types possible in
+	// `fields.types`.
+	// Values are `unionType` structs.
+	unionTypes map[string]unionType
+
+	// Types that are present in `fields` or `children` but are not defined at the top
+	// level. We always keep references to these and create an empty, private struct for
+	// them.
+	// Values are struct names.
+	unknown map[string]string
+}
+
+func newNodeMap() nodeMap {
+	return nodeMap{
+		namedExported:   make(map[string]string),
+		unnamedExported: make(map[string]string),
+		supertypes:      make(map[string]unionType),
+		unionTypes:      make(map[string]unionType),
+		unknown:         make(map[string]string),
+	}
+}
+
+func (nm *nodeMap) registerNodeType(nodeType nodeType) {
+	structName := generateStructName(nodeType.Type, nodeType.Named)
+	if nodeType.Named {
+		nm.namedExported[nodeType.Type] = structName
+		return
+	}
+
+	nm.unnamedExported[nodeType.Type] = structName
+}
+
+func (nm *nodeMap) getStructName(typeName string, named bool) (string, bool) {
+	// Check relevant named maps, then check unknown types
+	if named {
+		if structName, ok := nm.namedExported[typeName]; ok {
+			return structName, true
+		}
+		if structName, ok := nm.supertypes[typeName]; ok {
+			return structName.name, true
+		}
+	}
+
+	if !named {
+		if structName, ok := nm.unnamedExported[typeName]; ok {
+			return structName, true
+		}
+	}
+
+	structName, ok := nm.unknown[typeName]
+	return structName, ok
+}
+
+func (nm *nodeMap) registerSupertype(typeName string, members []nodeChildType) {
+	structName := generateStructName(typeName, true)
+	nm.supertypes[typeName] = unionType{name: structName, members: members}
+}
+
+func (nm *nodeMap) registerUnionType(members []nodeChildType) error {
+	if len(members) < 2 {
+		return fmt.Errorf("Cannot create union type with less than 2 members")
+	}
+
+	structTypeNames := []string{}
+	tsNodeTypeNames := []string{}
+	slices.SortFunc(members, func(a, b nodeChildType) int {
+		return cmp.Compare(a.Type, b.Type)
+	})
+
+	for _, type_ := range members {
+		structTypeNames = append(structTypeNames, createPrivateName(type_.Type))
+		tsNodeTypeNames = append(tsNodeTypeNames, type_.Type)
+	}
+
+	structTypeName := strings.Join(structTypeNames, "_")
+	tsNodeTypeName := strings.Join(tsNodeTypeNames, "_")
+
+	nm.unionTypes[tsNodeTypeName] = unionType{
+		name:    structTypeName,
+		members: members,
+	}
+
+	return nil
+}
+
+func (nm *nodeMap) getUnionType(types []nodeChildType) (unionType, bool) {
+	if len(types) < 2 {
+		return unionType{}, false
+	}
+
+	tsNodeTypeNames := []string{}
+	slices.SortFunc(types, func(a, b nodeChildType) int {
+		return cmp.Compare(a.Type, b.Type)
+	})
+
+	for _, type_ := range types {
+		tsNodeTypeNames = append(tsNodeTypeNames, type_.Type)
+	}
+
+	tsNodeTypeName := strings.Join(tsNodeTypeNames, "_")
+
+	ut, ok := nm.unionTypes[tsNodeTypeName]
+	if !ok {
+		return unionType{}, false
+	}
+
+	return ut, true
+}
+
+func (nm *nodeMap) registerUnknownType(typeName string) {
+	structName := "Unknown__" + createPrivateName(typeName)
+	nm.unknown[typeName] = structName
+}
+
 func (g *Generator) Generate(data []byte) (string, error) {
 	var nodeTypes nodeTypes
 	err := json.Unmarshal(data, &nodeTypes)
@@ -81,68 +211,112 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	}
 
 	file := jen.NewFile(packageName)
-	unionTypes := make(map[string]unionType)
+	nm := newNodeMap()
 
-	// Collect all the union types in the file and register them in the slice
-	// All supertypes are considered exported union types, and we create private
-	// union types from `fields` and `children` of other types.
+	// Get all the node types available in the file
 	for _, nodeType := range nodeTypes {
+		// Top level names go straight into the map
+		nm.registerNodeType(nodeType)
+
+		// Collect all the union types in the file and register them in the slice
+		// All supertypes are considered exported union types, and we create private
+		// union types from `fields` and `children` of other types.
 		if nodeType.Subtypes != nil {
 			// This is a supertype, so we always export it and use the type name
 			// as the name of the union type.
-			unionType := unionType{
-				name:    createExportedName(nodeType.Type),
-				members: nodeType.Subtypes,
-			}
-			unionTypes[unionType.name] = unionType
+			nm.registerSupertype(nodeType.Type, nodeType.Subtypes)
 		} else {
 			// Check the fields and children of the type
 			for name, children := range nodeType.Fields {
 				if len(children.Types) > 1 {
 					// This is a union type, so we create a private union type
 					// from the types in the field.
-					unionTypeName, err := generateUnionTypeName(children.Types)
+					err = nm.registerUnionType(children.Types)
 					if err != nil {
-						return "", fmt.Errorf("Failed to generate union type name for %s.%s: %w", nodeType.Type, name, err)
+						return "", fmt.Errorf("Failed to register a union type for %s.%s: %w", nodeType.Type, name, err)
 					}
-					unionType := unionType{
-						name:    unionTypeName,
-						members: children.Types,
-					}
-					unionTypes[unionType.name] = unionType
 				}
 			}
 
 			if len(nodeType.Children.Types) > 1 {
-				unionTypeName, err := generateUnionTypeName(nodeType.Children.Types)
+				err = nm.registerUnionType(nodeType.Children.Types)
 				if err != nil {
-					return "", fmt.Errorf("Failed to generate union type name for %s: %w", nodeType.Type, err)
+					return "", fmt.Errorf("Failed to register a union type for %s children: %w", nodeType.Type, err)
 				}
-				unionType := unionType{
-					name:    unionTypeName,
-					members: nodeType.Children.Types,
-				}
-				unionTypes[unionType.name] = unionType
 			}
 		}
 	}
 
-	fmt.Println(unionTypes)
-
+	// Check through again to see if there are any types used in fields/children that
+	// aren't defined. At time of writing, Python node-types.json uses `as_pattern_target`
+	// which is never declared.
+	//
+	// If we find any, we'll create private type names for them and mark them as unknown.
 	for _, nodeType := range nodeTypes {
-		if nodeType.Subtypes == nil {
-			err := addNodeType(file, nodeType)
-			if err != nil {
-				return "", fmt.Errorf("Failed to add node type %s: %w", nodeType.Type, err)
+		for _, field := range nodeType.Fields {
+			for _, fieldType := range field.Types {
+				_, ok := nm.getStructName(fieldType.Type, fieldType.Named)
+				if !ok {
+					nm.registerUnknownType(fieldType.Type)
+				}
+			}
+		}
+
+		for _, childType := range nodeType.Children.Types {
+			_, ok := nm.getStructName(childType.Type, childType.Named)
+			if !ok {
+				nm.registerUnknownType(childType.Type)
 			}
 		}
 	}
 
-	for _, unionType := range unionTypes {
-		err := addUnionType(file, unionType)
+	if g.options.Debug {
+		fmt.Println(nm)
+	}
+
+	if g.options.Debug {
+		file.Comment("\nGENERAL NODES\n")
+	}
+	for _, nodeType := range nodeTypes {
+		if nodeType.Subtypes != nil {
+			continue
+		}
+
+		if g.options.Debug {
+			fmt.Printf("Adding node type %s\n", nodeType.Type)
+		}
+		err := addNodeType(file, nodeType, &nm)
+		if err != nil {
+			return "", fmt.Errorf("Failed to add node type %s: %w", nodeType.Type, err)
+		}
+	}
+
+	if g.options.Debug {
+		file.Comment("\nSUPERTYPES\n")
+	}
+	for _, supertype := range nm.supertypes {
+		err := addUnionType(file, supertype, &nm)
+		if err != nil {
+			return "", fmt.Errorf("Failed to add supertype %s: %w", supertype.name, err)
+		}
+	}
+
+	if g.options.Debug {
+		file.Comment("\nUNION TYPES\n")
+	}
+	for _, unionType := range nm.unionTypes {
+		err := addUnionType(file, unionType, &nm)
 		if err != nil {
 			return "", fmt.Errorf("Failed to add union type %s: %w", unionType.name, err)
 		}
+	}
+
+	// Add empty structs for the unknown types. They can be private.
+	if g.options.Debug {
+		file.Comment("\nUNKNOWN TYPES\n")
+	}
+	for _, unknownType := range nm.unknown {
+		file.Type().Id(unknownType).Struct()
 	}
 
 	outputBuilder := &strings.Builder{}
@@ -154,38 +328,35 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	return outputBuilder.String(), nil
 }
 
-// generateUnionTypeName creates a combined name for a union type. This is always
-// unexported.
-func generateUnionTypeName(types []nodeChildType) (string, error) {
-	if len(types) < 2 {
-		return "", fmt.Errorf("Cannot create union type with less than 2 members")
+// generateStructName generates a private or exported struct name based on the given
+// nodeType. It will also add an `Unnamed_` prefix if the node is not a named node.
+func generateStructName(typeName string, named bool) string {
+	structName := createExportedName(typeName)
+	if !named {
+		structName = "Unnamed_" + structName
 	}
-
-	typeNames := []string{}
-	slices.SortFunc(types, func(a, b nodeChildType) int {
-		return cmp.Compare(a.Type, b.Type)
-	})
-
-	for _, type_ := range types {
-		typeNames = append(typeNames, createPrivateName(type_.Type))
-	}
-	return strings.Join(typeNames, "_"), nil
+	return structName
 }
 
-func addNodeType(file *jen.File, nodeType nodeType) error {
+func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 	fieldDefs := []structFieldDef{}
 
 	for name, field := range nodeType.Fields {
 		typeName := ""
 
 		if len(field.Types) == 1 {
-			typeName = createExportedName(field.Types[0].Type)
-		} else {
-			unionTypeName, err := generateUnionTypeName(field.Types)
-			if err != nil {
-				return fmt.Errorf("Failed to generate union type name for %s.%s: %w", nodeType.Type, name, err)
+			fieldType := field.Types[0]
+			structName, ok := nm.getStructName(fieldType.Type, fieldType.Named)
+			if !ok {
+				return fmt.Errorf("Failed to find TS node %s in map", field.Types[0].Type)
 			}
-			typeName = unionTypeName
+			typeName = structName
+		} else {
+			unionType, ok := nm.getUnionType(field.Types)
+			if !ok {
+				return fmt.Errorf("Failed to find union type for %s.%s types", nodeType.Type, name)
+			}
+			typeName = unionType.name
 		}
 
 		if !field.Required {
@@ -205,9 +376,12 @@ func addNodeType(file *jen.File, nodeType nodeType) error {
 		structFields = append(structFields, stmt)
 	}
 
-	structName := createExportedName(nodeType.Type)
+	structName, ok := nm.getStructName(nodeType.Type, nodeType.Named)
+	if !ok {
+		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
+	}
 	structMethodIdentifier := strings.ToLower(string(structName[0]))
-	file.Type().Id(createExportedName(nodeType.Type)).Struct(structFields...)
+	file.Type().Id(structName).Struct(structFields...)
 
 	// TODO: pull struct writing out into a function
 	for _, fieldDef := range fieldDefs {
@@ -226,15 +400,19 @@ func addNodeType(file *jen.File, nodeType nodeType) error {
 	return nil
 }
 
-func addUnionType(file *jen.File, unionType unionType) error {
+func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 	// A union type is a struct containing fields for each of the types in the
 	// union. These are all pointers to indicate that any of them could be nil.
 	// The types of the fields should always be exported.
 	fieldDefs := []structFieldDef{}
-	for _, type_ := range unionType.members {
+	for _, member := range unionType.members {
+		typeName, ok := nm.getStructName(member.Type, member.Named)
+		if !ok {
+			return fmt.Errorf("Failed to find struct name for %s.%s", unionType.name, member.Type)
+		}
 		fieldDefs = append(fieldDefs, structFieldDef{
-			name:     createPrivateName(type_.Type),
-			typeName: createExportedName(type_.Type),
+			name:     createPrivateName(member.Type),
+			typeName: typeName,
 		})
 	}
 
@@ -318,9 +496,9 @@ func createPrivateName(s string) string {
 func symbolToWord(r rune) string {
 	switch r {
 	case '&':
-		return "And"
+		return "Ampersand"
 	case '|':
-		return "Or"
+		return "Bar"
 	case '!':
 		return "Not"
 	case '=':
