@@ -64,6 +64,8 @@ type unionType struct {
 type structFieldDef struct {
 	name     string
 	typeName string
+	pointer  bool
+	array    bool
 }
 
 // Inner map keys are all Tree-sitter node names
@@ -359,43 +361,20 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 			typeName = unionType.name
 		}
 
-		if !field.Required {
-			typeName = "*" + typeName
-		}
-
 		fieldDefs = append(fieldDefs, structFieldDef{
-			name:     name,
+			name:     createPrivateName(name),
 			typeName: typeName,
+			pointer:  !field.Required,
+			array:    field.Multiple,
 		})
-	}
-
-	structFields := []jen.Code{}
-
-	for _, fieldDef := range fieldDefs {
-		stmt := jen.Id(createPrivateName(fieldDef.name)).Id(fieldDef.typeName)
-		structFields = append(structFields, stmt)
 	}
 
 	structName, ok := nm.getStructName(nodeType.Type, nodeType.Named)
 	if !ok {
 		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
 	}
-	structMethodIdentifier := strings.ToLower(string(structName[0]))
-	file.Type().Id(structName).Struct(structFields...)
 
-	// TODO: pull struct writing out into a function
-	for _, fieldDef := range fieldDefs {
-		file.Func().
-			Parens(
-				jen.Id(structMethodIdentifier).Op("*").Id(structName),
-			).
-			Id(createExportedName(fieldDef.name)).
-			Parens(jen.Null()).
-			Id(fieldDef.typeName).
-			Block(
-				jen.Return(jen.Id(structMethodIdentifier).Dot(createPrivateName(fieldDef.name))),
-			)
-	}
+	writeStruct(file, structName, fieldDefs)
 
 	return nil
 }
@@ -413,33 +392,54 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 		fieldDefs = append(fieldDefs, structFieldDef{
 			name:     createPrivateName(member.Type),
 			typeName: typeName,
+			pointer:  true,
+			array:    false,
 		})
 	}
 
+	writeStruct(file, unionType.name, fieldDefs)
+
+	return nil
+}
+
+func writeStruct(file *jen.File, name string, fieldDefs []structFieldDef) {
 	structFields := []jen.Code{}
 	for _, fieldDef := range fieldDefs {
-		stmt := jen.Id(fieldDef.name).Op("*").Id(fieldDef.typeName)
+		stmt := jen.Id(fieldDef.name)
+		if fieldDef.pointer {
+			stmt = stmt.Op("*")
+		}
+		if fieldDef.array {
+			stmt = stmt.Index()
+		}
+		stmt.Id(fieldDef.typeName)
 		structFields = append(structFields, stmt)
 	}
 
-	file.Type().Id(unionType.name).Struct(structFields...)
+	file.Type().Id(name).Struct(structFields...)
 
-	structMethodIdentifier := strings.ToLower(string(unionType.name[0]))
+	structMethodIdentifier := strings.ToLower(string(name[0]))
 	for _, fieldDef := range fieldDefs {
 		file.Func().
 			Parens(
-				jen.Id(structMethodIdentifier).Op("*").Id(unionType.name),
+				jen.Id(structMethodIdentifier).Op("*").Id(name),
 			).
 			Id(fieldDef.typeName).
-			Parens(jen.Null()).
-			Op("*").
+			Parens(jen.Null())
+
+		if fieldDef.pointer {
+			file.Op("*")
+		}
+		if fieldDef.array {
+			file.Index()
+		}
+
+		file.
 			Id(fieldDef.typeName).
 			Block(
 				jen.Return(jen.Id(structMethodIdentifier).Dot(fieldDef.name)),
 			)
 	}
-
-	return nil
 }
 
 // createExportedName creates a name that is safe to use as an exported symbol name
