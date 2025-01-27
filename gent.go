@@ -230,9 +230,6 @@ func (g *Generator) Generate(data []byte) (string, error) {
 
 	// Get all the node types available in the file
 	for _, nodeType := range nodeTypes {
-		// Top level names go straight into the map
-		nm.registerNodeType(nodeType)
-
 		// Collect all the union types in the file and register them in the slice
 		// All supertypes are considered exported union types, and we create private
 		// union types from `fields` and `children` of other types.
@@ -241,6 +238,9 @@ func (g *Generator) Generate(data []byte) (string, error) {
 			// as the name of the union type.
 			nm.registerSupertype(nodeType.Type, nodeType.Subtypes)
 		} else {
+			// Top level names go straight into the map
+			nm.registerNodeType(nodeType)
+
 			// Check the fields and children of the type
 			for name, children := range nodeType.Fields {
 				if len(children.Types) > 1 {
@@ -288,6 +288,35 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		fmt.Println(nm)
 	}
+
+	// Create an enum for the public node types
+	file.Type().Id("SyntaxKind").Op("=").String()
+	var publicTypes []jen.Code
+
+	addPublicType := func(name string, tsKindName string) {
+		publicTypes = append(publicTypes, jen.Id("SyntaxKind_"+name).Id("SyntaxKind").Op("=").Lit(tsKindName))
+	}
+
+	if g.options.Debug {
+		publicTypes = append(publicTypes, file.Comment("Named types"))
+	}
+	for tsKindName, structName := range nm.namedExported {
+		addPublicType(structName, tsKindName)
+	}
+	if g.options.Debug {
+		publicTypes = append(publicTypes, file.Comment("Unnamed types"))
+	}
+	for tsKindName, structName := range nm.unnamedExported {
+		addPublicType(structName, tsKindName)
+	}
+	if g.options.Debug {
+		publicTypes = append(publicTypes, file.Comment("Supertypes"))
+	}
+	for tsKindName, unionType := range nm.supertypes {
+		addPublicType(unionType.name, tsKindName)
+	}
+
+	file.Var().Defs(publicTypes...)
 
 	if g.options.Debug {
 		file.Comment("\nGENERAL NODES\n")
@@ -494,7 +523,7 @@ func writeStruct(file *jen.File, def structDef) {
 			// TODO: add validation logic
 			jen.
 				If(
-					jen.Id("node").Dot("Kind").Call().Op("!=").Lit(def.tsKind),
+					jen.Id("node").Dot("Kind").Call().Op("!=").Id(def.tsKind),
 				).
 				Block(
 					jen.Return(
