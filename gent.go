@@ -74,9 +74,10 @@ type methodDef struct {
 type structDef struct {
 	name string
 	// Tree-sitter node kind
-	tsKind      string
-	methods     []methodDef
-	isUnionType bool
+	tsKind            string
+	methods           []methodDef
+	isUnionType       bool
+	childrenMethodDef *methodDef
 }
 
 // Inner map keys are all Tree-sitter node names
@@ -388,7 +389,7 @@ func generateStructName(typeName string, named bool) string {
 }
 
 func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
-	fieldDefs := []methodDef{}
+	methodDefs := []methodDef{}
 
 	for name, field := range nodeType.Fields {
 		typeName := ""
@@ -413,7 +414,7 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 			}
 		}
 
-		fieldDefs = append(fieldDefs, methodDef{
+		methodDefs = append(methodDefs, methodDef{
 			name:       createPrivateName(name),
 			returnType: typeName,
 			array:      field.Multiple,
@@ -426,11 +427,50 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
 	}
 
+	// Add `Children` method if required
+	var childrenMethodDef *methodDef
+	if len(nodeType.Children.Types) > 0 {
+		methodName := "TypedChild"
+		if nodeType.Children.Multiple {
+			methodName = "TypedChildren"
+		}
+
+		if len(nodeType.Children.Types) == 1 {
+			child := nodeType.Children.Types[0]
+			childNodeName, ok := nm.getStructName(child.Type, child.Named)
+			if !ok {
+				return fmt.Errorf("Failed to find struct name for child %s of %s", child.Type, nodeType.Type)
+			}
+			childrenMethodDef = &methodDef{
+				name:       methodName,
+				returnType: childNodeName,
+				array:      nodeType.Children.Multiple,
+				tsKinds:    []string{child.Type},
+			}
+		} else {
+			unionType, ok := nm.getUnionType(nodeType.Children.Types)
+			if !ok {
+				return fmt.Errorf("Failed to find union type name for children of %s", nodeType.Type)
+			}
+			tsKinds := []string{}
+			for _, member := range unionType.members {
+				tsKinds = append(tsKinds, member.Type)
+			}
+			childrenMethodDef = &methodDef{
+				name:       methodName,
+				returnType: unionType.name,
+				array:      nodeType.Children.Multiple,
+				tsKinds:    tsKinds,
+			}
+		}
+	}
+
 	writeStruct(file, structDef{
-		name:        structName,
-		tsKind:      nodeType.Type,
-		methods:     fieldDefs,
-		isUnionType: false,
+		name:              structName,
+		tsKind:            nodeType.Type,
+		methods:           methodDefs,
+		isUnionType:       false,
+		childrenMethodDef: childrenMethodDef,
 	})
 
 	return nil
@@ -619,6 +659,91 @@ func writeStruct(file *jen.File, stDef structDef) {
 
 		file.Add(stmt)
 	}
+
+	if stDef.childrenMethodDef == nil {
+		return
+	}
+
+	returnTypeStmt := jen.Null()
+	if stDef.childrenMethodDef.array {
+		returnTypeStmt = returnTypeStmt.Index()
+	}
+	returnTypeStmt = returnTypeStmt.Id(stDef.childrenMethodDef.returnType)
+
+	// Default return type includes an error, but for arrays, we just return an empty
+	// array
+	if !stDef.childrenMethodDef.array {
+		returnTypeStmt = jen.Parens(jen.List(
+			jen.List(
+				returnTypeStmt,
+				jen.Error(),
+			),
+		))
+	}
+
+	functionParams := jen.Null()
+	var functionBody []jen.Code
+
+	// Take in a tree cursor for iterating
+	cursorVarName := "cursor"
+	functionParams = jen.Id(cursorVarName).Op("*").Qual("github.com/tree-sitter/go-tree-sitter", "TreeCursor")
+
+	singularVarName := "child"
+	pluralVarName := "children"
+	outputVarName := "output"
+
+	functionBody = []jen.Code{
+		jen.Id(pluralVarName).
+			Op(":=").
+			Id(structMethodIdentifier).
+			Dot("Node").
+			Dot("Children").
+			Call(jen.Id(cursorVarName)),
+		jen.Id(outputVarName).Op(":=").Index().Id(stDef.childrenMethodDef.returnType).Values(),
+		jen.For(
+			jen.List(jen.Id("_"), jen.Id(singularVarName)).
+				Op(":=").
+				Range().
+				Id(pluralVarName),
+		).
+			Block(
+				jen.If(jen.Id(singularVarName).Dot("IsNamed").Call()).Block(
+					jen.Id(outputVarName).Op("=").Append(
+						jen.Id(outputVarName),
+						jen.Id(stDef.childrenMethodDef.returnType).Values(jen.Dict{
+							jen.Id("Node"): jen.Id(singularVarName),
+						}),
+					),
+				),
+			),
+	}
+
+	if stDef.childrenMethodDef.array {
+		functionBody = append(functionBody, jen.Return(jen.Id(outputVarName)))
+	} else {
+		functionBody = append(functionBody, []jen.Code{
+			jen.If(jen.Len(jen.Id(outputVarName)).Op("==").Lit(0)).
+				Block(
+					jen.Return(
+						jen.Id(stDef.childrenMethodDef.returnType).Values(),
+						jen.Qual("fmt", "Errorf").Call(
+							jen.Lit("No children found on node of kind %s"),
+							jen.Lit(stDef.tsKind),
+						),
+					),
+				),
+			jen.Return(jen.Id(outputVarName).Index(jen.Lit(0)), jen.Nil()),
+		}...)
+	}
+
+	file.Func().
+		Parens(
+			jen.Id(structMethodIdentifier).Op("*").Id(stDef.name),
+		).
+		Id(stDef.childrenMethodDef.name).
+		Parens(functionParams).
+		Add(returnTypeStmt).
+		Block(functionBody...)
 }
 
 // createExportedName creates a name that is safe to use as an exported symbol name
