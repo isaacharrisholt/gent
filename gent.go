@@ -64,18 +64,19 @@ type unionType struct {
 	members []nodeChildType
 }
 
-type structFieldDef struct {
-	name     string
-	typeName string
-	pointer  bool
-	array    bool
+type methodDef struct {
+	name       string
+	returnType string
+	array      bool
+	tsKinds    []string
 }
 
 type structDef struct {
 	name string
 	// Tree-sitter node kind
-	tsKind string
-	fields []structFieldDef
+	tsKind      string
+	methods     []methodDef
+	isUnionType bool
 }
 
 // Inner map keys are all Tree-sitter node names
@@ -361,9 +362,9 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	}
 	for tsKind, unknownType := range nm.unknown {
 		writeStruct(file, structDef{
-			name:   unknownType,
-			tsKind: tsKind,
-			fields: []structFieldDef{},
+			name:    unknownType,
+			tsKind:  tsKind,
+			methods: []methodDef{},
 		})
 	}
 
@@ -387,10 +388,11 @@ func generateStructName(typeName string, named bool) string {
 }
 
 func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
-	fieldDefs := []structFieldDef{}
+	fieldDefs := []methodDef{}
 
 	for name, field := range nodeType.Fields {
 		typeName := ""
+		tsKinds := []string{}
 
 		if len(field.Types) == 1 {
 			fieldType := field.Types[0]
@@ -399,19 +401,23 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 				return fmt.Errorf("Failed to find TS node %s in map", field.Types[0].Type)
 			}
 			typeName = structName
+			tsKinds = append(tsKinds, fieldType.Type)
 		} else {
 			unionType, ok := nm.getUnionType(field.Types)
 			if !ok {
 				return fmt.Errorf("Failed to find union type for %s.%s types", nodeType.Type, name)
 			}
 			typeName = unionType.name
+			for _, member := range unionType.members {
+				tsKinds = append(tsKinds, member.Type)
+			}
 		}
 
-		fieldDefs = append(fieldDefs, structFieldDef{
-			name:     createPrivateName(name),
-			typeName: typeName,
-			pointer:  !field.Required,
-			array:    field.Multiple,
+		fieldDefs = append(fieldDefs, methodDef{
+			name:       createPrivateName(name),
+			returnType: typeName,
+			array:      field.Multiple,
+			tsKinds:    tsKinds,
 		})
 	}
 
@@ -421,9 +427,10 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 	}
 
 	writeStruct(file, structDef{
-		name:   structName,
-		tsKind: nodeType.Type,
-		fields: fieldDefs,
+		name:        structName,
+		tsKind:      nodeType.Type,
+		methods:     fieldDefs,
+		isUnionType: false,
 	})
 
 	return nil
@@ -433,49 +440,49 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 	// A union type is a struct containing fields for each of the types in the
 	// union. These are all pointers to indicate that any of them could be nil.
 	// The types of the fields should always be exported.
-	fieldDefs := []structFieldDef{}
+	fieldDefs := []methodDef{}
 	for _, member := range unionType.members {
 		typeName, ok := nm.getStructName(member.Type, member.Named)
 		if !ok {
 			return fmt.Errorf("Failed to find struct name for %s.%s", unionType.name, member.Type)
 		}
-		fieldDefs = append(fieldDefs, structFieldDef{
-			name:     createPrivateName(member.Type),
-			typeName: typeName,
-			pointer:  true,
-			array:    false,
+		fieldDefs = append(fieldDefs, methodDef{
+			name:       createPrivateName(member.Type),
+			returnType: typeName,
+			array:      false,
+			tsKinds:    []string{member.Type},
 		})
 	}
 
 	writeStruct(file, structDef{
-		name:   unionType.name,
-		fields: fieldDefs,
-		// TODO: TS kind? Or separate validator logic into new functions, most likely
+		name:        unionType.name,
+		methods:     fieldDefs,
+		isUnionType: true,
 	})
 
 	return nil
 }
 
-func writeStruct(file *jen.File, def structDef) {
+func writeStruct(file *jen.File, stDef structDef) {
 	embedField := jen.Qual("github.com/tree-sitter/go-tree-sitter", "Node")
 	structFields := []jen.Code{embedField}
 
-	for _, fieldDef := range def.fields {
-		stmt := jen.Id(fieldDef.name)
-		if fieldDef.pointer {
-			stmt = stmt.Op("*")
-		}
-		if fieldDef.array {
-			stmt = stmt.Index()
-		}
-		stmt.Id(fieldDef.typeName)
-		structFields = append(structFields, stmt)
-	}
+	// for _, fieldDef := range def.fields {
+	// 	stmt := jen.Id(fieldDef.name)
+	// 	if fieldDef.pointer {
+	// 		stmt = stmt.Op("*")
+	// 	}
+	// 	if fieldDef.array {
+	// 		stmt = stmt.Index()
+	// 	}
+	// 	stmt.Id(fieldDef.typeName)
+	// 	structFields = append(structFields, stmt)
+	// }
 
-	file.Type().Id(def.name).Struct(structFields...)
+	file.Type().Id(stDef.name).Struct(structFields...)
 
-	structMethodIdentifier := strings.ToLower(string(def.name[0]))
-	for _, fieldDef := range def.fields {
+	structMethodIdentifier := strings.ToLower(string(stDef.name[0]))
+	for _, fieldDef := range stDef.methods {
 		funcName := strings.ToUpper(string(fieldDef.name[0])) + fieldDef.name[1:]
 
 		// Need to make sure we don't override any of the reserved node methods,
@@ -484,63 +491,134 @@ func writeStruct(file *jen.File, def structDef) {
 			funcName = "Get" + funcName
 		}
 
+		returnTypeStmt := jen.Null()
+		if fieldDef.array {
+			returnTypeStmt = returnTypeStmt.Index()
+		}
+		returnTypeStmt = returnTypeStmt.Id(fieldDef.returnType)
+
+		// Default return type includes an error, but for arrays, we just return an empty
+		// array
+		if !fieldDef.array {
+			returnTypeStmt = jen.Parens(jen.List(
+				jen.List(
+					returnTypeStmt,
+					jen.Error(),
+				),
+			))
+		}
+
+		functionParams := jen.Null()
+		var functionBody []jen.Code
+
+		if stDef.isUnionType {
+			functionBody = []jen.Code{
+				jen.If(
+					jen.
+						Id(structMethodIdentifier).
+						Dot("Node").
+						Dot("Kind").
+						Call().
+						Op("==").
+						Lit(fieldDef.tsKinds[0]).
+						Block(
+							jen.Return(
+								jen.Id(fieldDef.returnType).Values(jen.Dict{
+									jen.Id("Node"): jen.Id(structMethodIdentifier).Dot("Node"),
+								}),
+								jen.Nil(),
+							),
+						),
+				),
+				jen.Return(
+					jen.Id(fieldDef.returnType).Values(),
+					jen.Qual("fmt", "Errorf").Call(
+						jen.Lit("Node is a %s, not a %s"),
+						jen.Id(structMethodIdentifier).Dot("Node").Dot("Kind").Call(),
+						jen.Lit(fieldDef.tsKinds[0]),
+					),
+				),
+			}
+		} else if fieldDef.array {
+			// Take in a tree cursor for iterating
+			cursorVarName := "cursor"
+			functionParams = jen.Id(cursorVarName).Op("*").Qual("github.com/tree-sitter/go-tree-sitter", "TreeCursor")
+
+			singularVarName := "child"
+			pluralVarName := "children"
+			outputVarName := "output"
+
+			functionBody = []jen.Code{
+				jen.Id(pluralVarName).
+					Op(":=").
+					Id(structMethodIdentifier).
+					Dot("Node").
+					Dot("ChildrenByFieldName").
+					Call(
+						jen.Lit(fieldDef.name),
+						jen.Id(cursorVarName),
+					),
+				jen.Id(outputVarName).Op(":=").Index().Id(fieldDef.returnType).Values(),
+				jen.For(
+					jen.List(jen.Id("_"), jen.Id(singularVarName)).
+						Op(":=").
+						Range().
+						Id(pluralVarName),
+				).
+					Block(
+						jen.Id(outputVarName).Op("=").Append(
+							jen.Id(outputVarName),
+							jen.Id(fieldDef.returnType).Values(jen.Dict{
+								jen.Id("Node"): jen.Id(singularVarName),
+							}),
+						),
+					),
+				jen.Return(jen.Id(outputVarName)),
+			}
+		} else {
+			varName := "child"
+
+			functionBody = []jen.Code{
+				jen.Id(varName).
+					Op(":=").
+					Id(structMethodIdentifier).
+					Dot("Node").
+					Dot("ChildByFieldName").
+					Call(jen.Lit(fieldDef.name)),
+				jen.
+					If(
+						jen.Id(varName).Op("==").Nil(),
+					).
+					Block(
+						jen.Return(
+							jen.Id(fieldDef.returnType).Values(),
+							jen.Qual("fmt", "Errorf").Call(
+								jen.Lit("Node of kind %s has no "+varName+" of name %s"),
+								jen.Lit(stDef.tsKind),
+								jen.Lit(fieldDef.name),
+							),
+						),
+					),
+				jen.Return(
+					jen.Id(fieldDef.returnType).Values(jen.Dict{
+						jen.Id("Node"): jen.Op("*").Id("child"),
+					}),
+					jen.Nil(),
+				),
+			}
+		}
+
 		stmt := jen.Func().
 			Parens(
-				jen.Id(structMethodIdentifier).Op("*").Id(def.name),
+				jen.Id(structMethodIdentifier).Op("*").Id(stDef.name),
 			).
 			Id(funcName).
-			Parens(jen.Null())
-
-		if fieldDef.pointer {
-			stmt = stmt.Op("*")
-		}
-		if fieldDef.array {
-			stmt = stmt.Index()
-		}
-
-		stmt = stmt.
-			Id(fieldDef.typeName).
-			Block(
-				jen.Return(jen.Id(structMethodIdentifier).Dot(fieldDef.name)),
-			)
+			Parens(functionParams).
+			Add(returnTypeStmt).
+			Block(functionBody...)
 
 		file.Add(stmt)
 	}
-
-	file.Func().
-		Parens(
-			jen.Id(structMethodIdentifier).Op("*").Id(def.name),
-		).
-		Id("Validate").
-		Parens(jen.Id("node").Qual("github.com/tree-sitter/go-tree-sitter", "Node")).
-		Parens(
-			jen.List(
-				jen.Id(def.name),
-				jen.Error(),
-			),
-		).
-		Block(
-			// TODO: add validation logic
-			jen.
-				If(
-					jen.Id("node").Dot("Kind").Call().Op("!=").Id(def.tsKind),
-				).
-				Block(
-					jen.Return(
-						jen.Id(def.name).Values(),
-						jen.Qual("fmt", "Errorf").Call(
-							jen.Lit("Expected node of kind "+strings.ReplaceAll(def.tsKind, "%", "%%")+", got %s"),
-							jen.Id("node").Dot("Kind").Call(),
-						),
-					),
-				),
-			jen.Return(
-				jen.Id(def.name).Values(jen.Dict{
-					jen.Id("Node"): jen.Id("node"),
-				}),
-				jen.Nil(),
-			),
-		)
 }
 
 // createExportedName creates a name that is safe to use as an exported symbol name
