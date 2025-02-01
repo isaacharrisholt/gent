@@ -11,6 +11,7 @@ import (
 
 	"github.com/dave/jennifer/jen"
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
@@ -39,11 +40,11 @@ func NewGenerator(options GeneratorOptions) *Generator {
 type nodeTypes []nodeType
 
 type nodeType struct {
-	Type     string                  `json:"type"`
-	Named    bool                    `json:"named"`
-	Fields   map[string]nodeChildren `json:"fields"`
-	Children nodeChildren            `json:"children"`
-	Subtypes []nodeChildType         `json:"subtypes"`
+	Type     string                                      `json:"type"`
+	Named    bool                                        `json:"named"`
+	Fields   orderedmap.OrderedMap[string, nodeChildren] `json:"fields"`
+	Children nodeChildren                                `json:"children"`
+	Subtypes []nodeChildType                             `json:"subtypes"`
 }
 
 type nodeChildren struct {
@@ -84,71 +85,71 @@ type structDef struct {
 type nodeMap struct {
 	// Top-level node definitions, supertypes.
 	// Values are struct names.
-	namedExported map[string]string
+	namedExported *orderedmap.OrderedMap[string, string]
 
 	// Symbols, etc. that have `"named": false` but still need exporting.
 	// Values are struct names.
-	unnamedExported map[string]string
+	unnamedExported *orderedmap.OrderedMap[string, string]
 
 	// Supertypes. Values are `unionType` structs.
-	supertypes map[string]unionType
+	supertypes *orderedmap.OrderedMap[string, unionType]
 
 	// Types made from a combination of other types, e.g. the multiple types possible in
 	// `fields.types`.
 	// Values are `unionType` structs.
-	unionTypes map[string]unionType
+	unionTypes *orderedmap.OrderedMap[string, unionType]
 
 	// Types that are present in `fields` or `children` but are not defined at the top
 	// level. We always keep references to these and create an empty, private struct for
 	// them.
 	// Values are struct names.
-	unknown map[string]string
+	unknown *orderedmap.OrderedMap[string, string]
 }
 
 func newNodeMap() nodeMap {
 	return nodeMap{
-		namedExported:   make(map[string]string),
-		unnamedExported: make(map[string]string),
-		supertypes:      make(map[string]unionType),
-		unionTypes:      make(map[string]unionType),
-		unknown:         make(map[string]string),
+		namedExported:   orderedmap.New[string, string](),
+		unnamedExported: orderedmap.New[string, string](),
+		supertypes:      orderedmap.New[string, unionType](),
+		unionTypes:      orderedmap.New[string, unionType](),
+		unknown:         orderedmap.New[string, string](),
 	}
 }
 
 func (nm *nodeMap) registerNodeType(nodeType nodeType) {
 	structName := generateStructName(nodeType.Type, nodeType.Named)
 	if nodeType.Named {
-		nm.namedExported[nodeType.Type] = structName
+		nm.namedExported.Set(nodeType.Type, structName)
 		return
 	}
 
-	nm.unnamedExported[nodeType.Type] = structName
+	nm.unnamedExported.Set(nodeType.Type, structName)
 }
 
 func (nm *nodeMap) getStructName(typeName string, named bool) (string, bool) {
 	// Check relevant named maps, then check unknown types
 	if named {
-		if structName, ok := nm.namedExported[typeName]; ok {
+		if structName, ok := nm.namedExported.Get(typeName); ok {
 			return structName, true
 		}
-		if structName, ok := nm.supertypes[typeName]; ok {
+		if structName, ok := nm.supertypes.Get(typeName); ok {
 			return structName.name, true
 		}
 	}
 
 	if !named {
-		if structName, ok := nm.unnamedExported[typeName]; ok {
+		if structName, ok := nm.unnamedExported.Get(typeName); ok {
 			return structName, true
 		}
 	}
 
-	structName, ok := nm.unknown[typeName]
+	structName, ok := nm.unknown.Get(typeName)
 	return structName, ok
 }
 
 func (nm *nodeMap) registerSupertype(typeName string, members []nodeChildType) {
 	structName := generateStructName(typeName, true)
-	nm.supertypes[typeName] = unionType{name: structName, members: members}
+	nm.supertypes.Set(typeName, unionType{name: structName, members: members})
 }
 
 func (nm *nodeMap) registerUnionType(members []nodeChildType) error {
@@ -170,10 +171,10 @@ func (nm *nodeMap) registerUnionType(members []nodeChildType) error {
 	structTypeName := strings.Join(structTypeNames, "_")
 	tsNodeTypeName := strings.Join(tsNodeTypeNames, "_")
 
-	nm.unionTypes[tsNodeTypeName] = unionType{
+	nm.unionTypes.Set(tsNodeTypeName, unionType{
 		name:    structTypeName,
 		members: members,
-	}
+	})
 
 	return nil
 }
@@ -194,7 +195,7 @@ func (nm *nodeMap) getUnionType(types []nodeChildType) (unionType, bool) {
 
 	tsNodeTypeName := strings.Join(tsNodeTypeNames, "_")
 
-	ut, ok := nm.unionTypes[tsNodeTypeName]
+	ut, ok := nm.unionTypes.Get(tsNodeTypeName)
 	if !ok {
 		return unionType{}, false
 	}
@@ -204,7 +205,7 @@ func (nm *nodeMap) getUnionType(types []nodeChildType) (unionType, bool) {
 
 func (nm *nodeMap) registerUnknownType(typeName string) {
 	structName := "Unknown__" + createPrivateName(typeName)
-	nm.unknown[typeName] = structName
+	nm.unknown.Set(typeName, structName)
 }
 
 func (g *Generator) Generate(data []byte) (string, error) {
@@ -244,7 +245,7 @@ func (g *Generator) Generate(data []byte) (string, error) {
 			nm.registerNodeType(nodeType)
 
 			// Check the fields and children of the type
-			for name, children := range nodeType.Fields {
+			for name, children := range nodeType.Fields.FromOldest() {
 				if len(children.Types) > 1 {
 					// This is a union type, so we create a private union type
 					// from the types in the field.
@@ -270,7 +271,7 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	//
 	// If we find any, we'll create private type names for them and mark them as unknown.
 	for _, nodeType := range nodeTypes {
-		for _, field := range nodeType.Fields {
+		for _, field := range nodeType.Fields.FromOldest() {
 			for _, fieldType := range field.Types {
 				_, ok := nm.getStructName(fieldType.Type, fieldType.Named)
 				if !ok {
@@ -302,19 +303,19 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		publicTypes = append(publicTypes, file.Comment("Named types"))
 	}
-	for tsKindName, structName := range nm.namedExported {
+	for tsKindName, structName := range nm.namedExported.FromOldest() {
 		addPublicType(structName, tsKindName)
 	}
 	if g.options.Debug {
 		publicTypes = append(publicTypes, file.Comment("Unnamed types"))
 	}
-	for tsKindName, structName := range nm.unnamedExported {
+	for tsKindName, structName := range nm.unnamedExported.FromOldest() {
 		addPublicType(structName, tsKindName)
 	}
 	if g.options.Debug {
 		publicTypes = append(publicTypes, file.Comment("Supertypes"))
 	}
-	for tsKindName, unionType := range nm.supertypes {
+	for tsKindName, unionType := range nm.supertypes.FromOldest() {
 		addPublicType(unionType.name, tsKindName)
 	}
 
@@ -340,7 +341,7 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		file.Comment("\nSUPERTYPES\n")
 	}
-	for _, supertype := range nm.supertypes {
+	for _, supertype := range nm.supertypes.FromOldest() {
 		err := addUnionType(file, supertype, &nm)
 		if err != nil {
 			return "", fmt.Errorf("Failed to add supertype %s: %w", supertype.name, err)
@@ -350,7 +351,7 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		file.Comment("\nUNION TYPES\n")
 	}
-	for _, unionType := range nm.unionTypes {
+	for _, unionType := range nm.unionTypes.FromOldest() {
 		err := addUnionType(file, unionType, &nm)
 		if err != nil {
 			return "", fmt.Errorf("Failed to add union type %s: %w", unionType.name, err)
@@ -361,7 +362,7 @@ func (g *Generator) Generate(data []byte) (string, error) {
 	if g.options.Debug {
 		file.Comment("\nUNKNOWN TYPES\n")
 	}
-	for tsKind, unknownType := range nm.unknown {
+	for tsKind, unknownType := range nm.unknown.FromOldest() {
 		writeStruct(file, structDef{
 			name:    unknownType,
 			tsKind:  tsKind,
@@ -391,7 +392,7 @@ func generateStructName(typeName string, named bool) string {
 func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 	methodDefs := []methodDef{}
 
-	for name, field := range nodeType.Fields {
+	for name, field := range nodeType.Fields.FromOldest() {
 		typeName := ""
 		tsKinds := []string{}
 
