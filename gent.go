@@ -427,6 +427,11 @@ func generateStructName(typeName string, named bool) string {
 }
 
 func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
+	structName, ok := nm.getStructName(nodeType.Type, nodeType.Named)
+	if !ok {
+		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
+	}
+
 	methodDefs := []methodDef{}
 
 	for name, field := range nodeType.Fields.FromOldest() {
@@ -456,11 +461,6 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 			array:      field.Multiple,
 			tsKinds:    tsKinds,
 		})
-	}
-
-	structName, ok := nm.getStructName(nodeType.Type, nodeType.Named)
-	if !ok {
-		return fmt.Errorf("Failed to find struct name for %s", nodeType.Type)
 	}
 
 	// Add `Children` method if required
@@ -506,6 +506,42 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 		childrenMethodDef: childrenMethodDef,
 	})
 
+	// Create 'New*' function for creating a new struct given the tree-sitter node
+	file.
+		Func().
+		Id("New"+upperFirst(structName)).
+		Parens(
+			jen.Id("node").Op("*").Qual("github.com/tree-sitter/go-tree-sitter", "Node"),
+		).
+		Parens(
+			jen.List(
+				jen.Op("*").Id(structName),
+				jen.Error(),
+			),
+		).
+		Block(
+			jen.If(
+				jen.Id("node").Dot("Kind").Call().Op("!=").Lit(nodeType.Type),
+			).
+				Block(
+					jen.Return(
+						jen.Nil(),
+						jen.Qual("fmt", "Errorf").Call(
+							jen.Lit("Node is not a %s"),
+							jen.Lit(nodeType.Type),
+						),
+					),
+				),
+			jen.Return(
+				jen.Op("&").Id(structName).Values(
+					jen.Dict{
+						jen.Id("Node"): jen.Op("*").Id("node"),
+					},
+				),
+				jen.Nil(),
+			),
+		)
+
 	return nil
 }
 
@@ -536,27 +572,22 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 	return nil
 }
 
+func upperFirst(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return strings.ToUpper(string(s[0])) + s[1:]
+}
+
 func writeStruct(file *jen.File, stDef structDef) {
 	embedField := jen.Qual("github.com/tree-sitter/go-tree-sitter", "Node")
 	structFields := []jen.Code{embedField}
-
-	// for _, fieldDef := range def.fields {
-	// 	stmt := jen.Id(fieldDef.name)
-	// 	if fieldDef.pointer {
-	// 		stmt = stmt.Op("*")
-	// 	}
-	// 	if fieldDef.array {
-	// 		stmt = stmt.Index()
-	// 	}
-	// 	stmt.Id(fieldDef.typeName)
-	// 	structFields = append(structFields, stmt)
-	// }
 
 	file.Type().Id(stDef.name).Struct(structFields...)
 
 	structMethodIdentifier := strings.ToLower(string(stDef.name[0]))
 	for _, fieldDef := range stDef.methods {
-		funcName := strings.ToUpper(string(fieldDef.name[0])) + fieldDef.name[1:]
+		funcName := upperFirst(fieldDef.name)
 
 		// Need to make sure we don't override any of the reserved node methods,
 		// so prefix with 'Get' until the name is unique.
@@ -568,7 +599,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 		if fieldDef.array {
 			returnTypeStmt = returnTypeStmt.Index()
 		}
-		returnTypeStmt = returnTypeStmt.Id(fieldDef.returnType)
+		returnTypeStmt = returnTypeStmt.Op("*").Id(fieldDef.returnType)
 
 		// Default return type includes an error, but for arrays, we just return an empty
 		// array
@@ -595,6 +626,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 				jen.Id(tsKindsVarName).Op(":=").Add(tsKindsArrayLit),
 				jen.If(
 					jen.
+						Op("!").
 						Qual("slices", "Contains").
 						Call(
 							jen.Id(tsKindsVarName),
@@ -606,20 +638,20 @@ func writeStruct(file *jen.File, stDef structDef) {
 						).
 						Block(
 							jen.Return(
-								jen.Id(fieldDef.returnType).Values(jen.Dict{
-									jen.Id("Node"): jen.Id(structMethodIdentifier).Dot("Node"),
-								}),
 								jen.Nil(),
+								jen.Qual("fmt", "Errorf").Call(
+									jen.Lit("Node is a %s, not in %v"),
+									jen.Id(structMethodIdentifier).Dot("Node").Dot("Kind").Call(),
+									jen.Id(tsKindsVarName),
+								),
 							),
 						),
 				),
 				jen.Return(
-					jen.Id(fieldDef.returnType).Values(),
-					jen.Qual("fmt", "Errorf").Call(
-						jen.Lit("Node is a %s, not in %v"),
-						jen.Id(structMethodIdentifier).Dot("Node").Dot("Kind").Call(),
-						jen.Id(tsKindsVarName),
-					),
+					jen.Op("&").Id(fieldDef.returnType).Values(jen.Dict{
+						jen.Id("Node"): jen.Id(structMethodIdentifier).Dot("Node"),
+					}),
+					jen.Nil(),
 				),
 			}
 		} else if fieldDef.array {
@@ -641,7 +673,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 						jen.Lit(fieldDef.name),
 						jen.Id(cursorVarName),
 					),
-				jen.Id(outputVarName).Op(":=").Index().Id(fieldDef.returnType).Values(),
+				jen.Id(outputVarName).Op(":=").Index().Op("*").Id(fieldDef.returnType).Values(),
 				jen.For(
 					jen.List(jen.Id("_"), jen.Id(singularVarName)).
 						Op(":=").
@@ -651,7 +683,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 					Block(
 						jen.Id(outputVarName).Op("=").Append(
 							jen.Id(outputVarName),
-							jen.Id(fieldDef.returnType).Values(jen.Dict{
+							jen.Op("&").Id(fieldDef.returnType).Values(jen.Dict{
 								jen.Id("Node"): jen.Id(singularVarName),
 							}),
 						),
@@ -674,7 +706,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 					).
 					Block(
 						jen.Return(
-							jen.Id(fieldDef.returnType).Values(),
+							jen.Nil(),
 							jen.Qual("fmt", "Errorf").Call(
 								jen.Lit("Node of kind %s has no "+varName+" of name %s"),
 								jen.Lit(stDef.tsKind),
@@ -683,7 +715,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 						),
 					),
 				jen.Return(
-					jen.Id(fieldDef.returnType).Values(jen.Dict{
+					jen.Op("&").Id(fieldDef.returnType).Values(jen.Dict{
 						jen.Id("Node"): jen.Op("*").Id("child"),
 					}),
 					jen.Nil(),

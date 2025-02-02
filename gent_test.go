@@ -43,13 +43,11 @@ func TestPythonParse(t *testing.T) {
 	cursor := tree.Walk()
 	defer cursor.Close()
 
-	root := tree.RootNode()
-	if root.Kind() != dist.SyntaxKind_Module {
-		t.Fatalf("Expected root to be a module, got %v", root.Kind())
+	module, err := dist.NewModule(tree.RootNode())
+	if err != nil {
+		t.Fatalf("Failed to create gent node: %v", err)
 	}
-	// TODO: add functions to construct these
-	rootGentNode := dist.Module{Node: *root}
-	topLevelStatements := rootGentNode.TypedChildren(cursor)
+	topLevelStatements := module.TypedChildren(cursor)
 
 	expressionStatement0 := topLevelStatements[0]
 	if expressionStatement0.Kind() != dist.SyntaxKind_ImportStatement {
