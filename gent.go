@@ -208,6 +208,43 @@ func (nm *nodeMap) registerUnknownType(typeName string) {
 	nm.unknown.Set(typeName, structName)
 }
 
+// Method definitions describe what methods are available on the generated
+// struct. They also store all the possible Tree-sitter node kinds that
+// a particular field can represent.
+// They have to do this recursively, as a supertype might reference another
+// supertype, and so on.
+func (nm *nodeMap) getTSRecursiveTSKinds(typeName string) []string {
+	typesToCheck := []string{typeName}
+	tsKinds := []string{}
+
+	appendUnionTypeMembers := func(ut unionType) {
+		for _, member := range ut.members {
+			typesToCheck = append(typesToCheck, member.Type)
+		}
+	}
+
+	for len(typesToCheck) > 0 {
+		typeName := typesToCheck[0]
+		typesToCheck = typesToCheck[1:]
+
+		if superType, ok := nm.supertypes.Get(typeName); ok {
+			appendUnionTypeMembers(superType)
+			// Can't be a supertype and a non-supertype union
+			continue
+		}
+
+		if unionType, ok := nm.unionTypes.Get(typeName); ok {
+			appendUnionTypeMembers(unionType)
+			continue
+		}
+
+		// Otherwise, it's a base TS kind
+		tsKinds = append(tsKinds, typeName)
+	}
+
+	return tsKinds
+}
+
 func (g *Generator) Generate(data []byte) (string, error) {
 	var nodeTypes nodeTypes
 	err := json.Unmarshal(data, &nodeTypes)
@@ -403,16 +440,14 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 				return fmt.Errorf("Failed to find TS node %s in map", field.Types[0].Type)
 			}
 			typeName = structName
-			tsKinds = append(tsKinds, fieldType.Type)
+			tsKinds = append(tsKinds, nm.getTSRecursiveTSKinds(fieldType.Type)...)
 		} else {
 			unionType, ok := nm.getUnionType(field.Types)
 			if !ok {
 				return fmt.Errorf("Failed to find union type for %s.%s types", nodeType.Type, name)
 			}
 			typeName = unionType.name
-			for _, member := range unionType.members {
-				tsKinds = append(tsKinds, member.Type)
-			}
+			tsKinds = append(tsKinds, nm.getTSRecursiveTSKinds(unionType.name)...)
 		}
 
 		methodDefs = append(methodDefs, methodDef{
@@ -446,17 +481,14 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 				name:       methodName,
 				returnType: childNodeName,
 				array:      nodeType.Children.Multiple,
-				tsKinds:    []string{child.Type},
+				tsKinds:    nm.getTSRecursiveTSKinds(child.Type),
 			}
 		} else {
 			unionType, ok := nm.getUnionType(nodeType.Children.Types)
 			if !ok {
 				return fmt.Errorf("Failed to find union type name for children of %s", nodeType.Type)
 			}
-			tsKinds := []string{}
-			for _, member := range unionType.members {
-				tsKinds = append(tsKinds, member.Type)
-			}
+			tsKinds := nm.getTSRecursiveTSKinds(unionType.name)
 			childrenMethodDef = &methodDef{
 				name:       methodName,
 				returnType: unionType.name,
@@ -481,23 +513,23 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 	// A union type is a struct containing fields for each of the types in the
 	// union. These are all pointers to indicate that any of them could be nil.
 	// The types of the fields should always be exported.
-	fieldDefs := []methodDef{}
+	methodDefs := []methodDef{}
 	for _, member := range unionType.members {
 		typeName, ok := nm.getStructName(member.Type, member.Named)
 		if !ok {
 			return fmt.Errorf("Failed to find struct name for %s.%s", unionType.name, member.Type)
 		}
-		fieldDefs = append(fieldDefs, methodDef{
+		methodDefs = append(methodDefs, methodDef{
 			name:       createPrivateName(member.Type),
 			returnType: typeName,
 			array:      false,
-			tsKinds:    []string{member.Type},
+			tsKinds:    nm.getTSRecursiveTSKinds(member.Type),
 		})
 	}
 
 	writeStruct(file, structDef{
 		name:        unionType.name,
-		methods:     fieldDefs,
+		methods:     methodDefs,
 		isUnionType: true,
 	})
 
@@ -553,15 +585,25 @@ func writeStruct(file *jen.File, stDef structDef) {
 		var functionBody []jen.Code
 
 		if stDef.isUnionType {
+			tsKindsVarName := "tsKinds"
+			tsKindsArray := []jen.Code{}
+			for _, tsKind := range fieldDef.tsKinds {
+				tsKindsArray = append(tsKindsArray, jen.Lit(tsKind))
+			}
+			tsKindsArrayLit := jen.Index().String().Values(tsKindsArray...)
 			functionBody = []jen.Code{
+				jen.Id(tsKindsVarName).Op(":=").Add(tsKindsArrayLit),
 				jen.If(
 					jen.
-						Id(structMethodIdentifier).
-						Dot("Node").
-						Dot("Kind").
-						Call().
-						Op("==").
-						Lit(fieldDef.tsKinds[0]).
+						Qual("slices", "Contains").
+						Call(
+							jen.Id(tsKindsVarName),
+							jen.
+								Id(structMethodIdentifier).
+								Dot("Node").
+								Dot("Kind").
+								Call(),
+						).
 						Block(
 							jen.Return(
 								jen.Id(fieldDef.returnType).Values(jen.Dict{
@@ -574,9 +616,9 @@ func writeStruct(file *jen.File, stDef structDef) {
 				jen.Return(
 					jen.Id(fieldDef.returnType).Values(),
 					jen.Qual("fmt", "Errorf").Call(
-						jen.Lit("Node is a %s, not a %s"),
+						jen.Lit("Node is a %s, not in %v"),
 						jen.Id(structMethodIdentifier).Dot("Node").Dot("Kind").Call(),
-						jen.Lit(fieldDef.tsKinds[0]),
+						jen.Id(tsKindsVarName),
 					),
 				),
 			}

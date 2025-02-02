@@ -14,6 +14,7 @@ require (
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/tree-sitter/go-tree-sitter v0.24.0 // indirect
+	github.com/tree-sitter/tree-sitter-python v0.23.6 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.9-0.20240816141633-0a40785b4f41 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
