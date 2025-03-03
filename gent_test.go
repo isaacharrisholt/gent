@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/isaacharrisholt/gent"
-	"github.com/isaacharrisholt/gent/dist"
+	python "github.com/isaacharrisholt/gent/testdata"
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 )
@@ -32,10 +32,10 @@ func getPythonNodeText(node *tree_sitter.Node) string {
 }
 
 func TestPythonParse(t *testing.T) {
-	python := tree_sitter_python.Language()
+	tsPython := tree_sitter_python.Language()
 	parser := tree_sitter.NewParser()
 	defer parser.Close()
-	parser.SetLanguage(tree_sitter.NewLanguage(python))
+	parser.SetLanguage(tree_sitter.NewLanguage(tsPython))
 
 	tree := parser.Parse(testPythonProgram, nil)
 	defer tree.Close()
@@ -43,14 +43,14 @@ func TestPythonParse(t *testing.T) {
 	cursor := tree.Walk()
 	defer cursor.Close()
 
-	module, err := dist.NewModule(tree.RootNode())
+	module, err := python.NewModule(tree.RootNode())
 	if err != nil {
 		t.Fatalf("Failed to create gent node: %v", err)
 	}
 	topLevelStatements := module.TypedChildren(cursor)
 
 	expressionStatement0 := topLevelStatements[0]
-	if expressionStatement0.Kind() != dist.SyntaxKind_ImportStatement {
+	if expressionStatement0.Kind() != python.SyntaxKind_ImportStatement {
 		t.Fatalf("Expected first child to be an import statement, got %v", expressionStatement0.Kind())
 	}
 	// Validate that we can get to the import statement in a type-safe way
