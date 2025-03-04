@@ -66,10 +66,11 @@ type unionType struct {
 }
 
 type methodDef struct {
-	name       string
-	returnType string
-	array      bool
-	tsKinds    []string
+	methodName  string
+	tsFieldName string
+	returnType  string
+	array       bool
+	tsKinds     []string
 }
 
 type structDef struct {
@@ -456,10 +457,11 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 		}
 
 		methodDefs = append(methodDefs, methodDef{
-			name:       createPrivateName(name),
-			returnType: typeName,
-			array:      field.Multiple,
-			tsKinds:    tsKinds,
+			methodName:  createPrivateName(name),
+			tsFieldName: name,
+			returnType:  typeName,
+			array:       field.Multiple,
+			tsKinds:     tsKinds,
 		})
 	}
 
@@ -478,10 +480,11 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 				return fmt.Errorf("Failed to find struct name for child %s of %s", child.Type, nodeType.Type)
 			}
 			childrenMethodDef = &methodDef{
-				name:       methodName,
-				returnType: childNodeName,
-				array:      nodeType.Children.Multiple,
-				tsKinds:    nm.getTSRecursiveTSKinds(child.Type),
+				methodName:  methodName,
+				tsFieldName: child.Type,
+				returnType:  childNodeName,
+				array:       nodeType.Children.Multiple,
+				tsKinds:     nm.getTSRecursiveTSKinds(child.Type),
 			}
 		} else {
 			unionType, ok := nm.getUnionType(nodeType.Children.Types)
@@ -490,7 +493,7 @@ func addNodeType(file *jen.File, nodeType nodeType, nm *nodeMap) error {
 			}
 			tsKinds := nm.getTSRecursiveTSKinds(unionType.name)
 			childrenMethodDef = &methodDef{
-				name:       methodName,
+				methodName: methodName,
 				returnType: unionType.name,
 				array:      nodeType.Children.Multiple,
 				tsKinds:    tsKinds,
@@ -556,10 +559,11 @@ func addUnionType(file *jen.File, unionType unionType, nm *nodeMap) error {
 			return fmt.Errorf("Failed to find struct name for %s.%s", unionType.name, member.Type)
 		}
 		methodDefs = append(methodDefs, methodDef{
-			name:       createPrivateName(member.Type),
-			returnType: typeName,
-			array:      false,
-			tsKinds:    nm.getTSRecursiveTSKinds(member.Type),
+			methodName:  createPrivateName(member.Type),
+			tsFieldName: member.Type,
+			returnType:  typeName,
+			array:       false,
+			tsKinds:     nm.getTSRecursiveTSKinds(member.Type),
 		})
 	}
 
@@ -587,7 +591,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 
 	structMethodIdentifier := strings.ToLower(string(stDef.name[0]))
 	for _, fieldDef := range stDef.methods {
-		funcName := upperFirst(fieldDef.name)
+		funcName := upperFirst(fieldDef.methodName)
 
 		// Need to make sure we don't override any of the reserved node methods,
 		// so prefix with 'Get' until the name is unique.
@@ -670,7 +674,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 					Dot("Node").
 					Dot("ChildrenByFieldName").
 					Call(
-						jen.Lit(fieldDef.name),
+						jen.Lit(fieldDef.tsFieldName),
 						jen.Id(cursorVarName),
 					),
 				jen.Id(outputVarName).Op(":=").Index().Op("*").Id(fieldDef.returnType).Values(),
@@ -699,7 +703,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 					Id(structMethodIdentifier).
 					Dot("Node").
 					Dot("ChildByFieldName").
-					Call(jen.Lit(fieldDef.name)),
+					Call(jen.Lit(fieldDef.tsFieldName)),
 				jen.
 					If(
 						jen.Id(varName).Op("==").Nil(),
@@ -710,7 +714,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 							jen.Qual("fmt", "Errorf").Call(
 								jen.Lit("Node of kind %s has no "+varName+" of name %s"),
 								jen.Lit(stDef.tsKind),
-								jen.Lit(fieldDef.name),
+								jen.Lit(fieldDef.tsFieldName),
 							),
 						),
 					),
@@ -815,7 +819,7 @@ func writeStruct(file *jen.File, stDef structDef) {
 		Parens(
 			jen.Id(structMethodIdentifier).Op("*").Id(stDef.name),
 		).
-		Id(stDef.childrenMethodDef.name).
+		Id(stDef.childrenMethodDef.methodName).
 		Parens(functionParams).
 		Add(returnTypeStmt).
 		Block(functionBody...)
@@ -965,7 +969,7 @@ func getNodeMethodNames() []string {
 	t := reflect.TypeOf(node)
 
 	var names []string
-	for i := 0; i < t.NumMethod(); i++ {
+	for i := range t.NumMethod() {
 		names = append(names, t.Method(i).Name)
 	}
 	return names
